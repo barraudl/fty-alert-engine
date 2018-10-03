@@ -33,6 +33,7 @@
 #include <czmq.h>
 #include <malamute.h>
 #include <ftyproto.h>
+#include <fty_shm.h>
 #include <lua.h>
 #include <cxxtools/allocator.h>
 #include <fty_common.h>

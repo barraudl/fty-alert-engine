@@ -36,6 +36,8 @@
 #include <algorithm>
 #include <mutex>
 #include <unordered_map>
+#include <cxxtools/directory.h>
+#include <fty_shm.h>
 
 #define METRICS_STREAM "METRICS"
 #define RULES_SUBJECT "rfc-evaluator-rules"
@@ -517,6 +519,65 @@ evaluate_metric(
     return isEvaluate;
 }
 
+void traitement_metric(std::vector<fty::shm::ShmMetric>& result, MetricList& cache, mlm_client_t *client) {
+  
+    cache.removeOldMetrics();
+    // process accumulated stream messages
+    for (auto &element : result) {
+
+        //std::string topic = element.first;
+        //fty_proto_t *bmessage = element.second;
+
+        // process as metric message
+        const std::string type = element.getType();
+        const std::string name = element.getAsset();
+        const std::string value = element.getValue();
+        const std::string unit = element.getUnit();
+        uint32_t ttl = element.getTtl();
+        uint64_t timestamp = element.getTimestamp();
+        // TODO: 2016-04-27 ACE: fix it later, when "string" values
+        // in the metric would be considered as
+        // normal behaviour, but for now it is not supposed to be so
+        // -> generated error messages into the log
+        char *end;
+        double dvalue = strtod (value.c_str(), &end);
+        if (errno == ERANGE) {
+            errno = 0;
+            //fty_proto_print (bmessage);
+            log_error ("%s: can't convert value to double #1, ignore message", name.c_str());
+            continue;
+        }
+        else if (end == value || *end != '\0') {
+            //fty_proto_print (bmessage);
+            log_error ("%s: can't convert value to double #2, ignore message", name.c_str());
+            continue;
+        }
+        log_debug("%s: Got message '%s' with value %s", name.c_str(), "topic:metric", value.c_str());
+
+        // Update cache with new value
+        MetricInfo m (name, type, unit, dvalue, timestamp, "", ttl);
+        cache.addMetric (m);
+
+        //search if this metric is already evaluated and if this metric is evaluate
+        std::map < std::string, bool>::iterator found = evaluateMetrics.find (m.generateTopic());
+        bool metricfound = found != evaluateMetrics.end();
+        log_debug ("Check metric : %s", m.generateTopic().c_str());
+        if (metricfound && ManageFtyLog::getInstanceFtylog()->isLogDebug()) {
+            log_debug ("This metric is known and %s be evaluated", found->second ? "must" : "will not");
+        }
+
+        if (!metricfound || found->second) {
+            bool isEvaluate = evaluate_metric (client, m, cache, alertConfiguration);
+
+            //if the metric is evaluate for the first time, add to the list
+            if (!metricfound) {
+                log_debug ("Add %s evaluated metric '%s'", isEvaluate ? " " : "not", m.generateTopic().c_str());
+                evaluateMetrics[m.generateTopic()] = isEvaluate;
+            }
+        }
+    }
+}
+
 // convert licensing metric to fty_proto_metric
 static void
 s_convert_licensing_metric (zmsg_t **msg_p)
@@ -570,16 +631,24 @@ fty_alert_engine_stream(
     zpoller_t *poller = zpoller_new (pipe, mlm_client_msgpipe (client), NULL);
     assert (poller);
 
-    uint64_t timeout = 30000;
+    uint64_t timeout = 30000; //TODO READ CONFILE
     zsock_signal (pipe, 0);
     int64_t timeCash = zclock_mono();
     log_info("Actor %s started",name);
+    std::vector<fty::shm::ShmMetric> result;
     while (!zsys_interrupted) {
 
         //clear cache every 30 sec
-        if (zclock_mono() - timeCash > 30000) {
+        int64_t timeCurrent = zclock_mono() - timeCash;
+        if (timeCurrent >= timeout) {
             cache.removeOldMetrics();
             timeCash = zclock_mono();
+            //Timeout, need to get metrics and update refresh value
+            fty::shm::read_metrics("metric", ".*", ".*",  result);
+            timeout = 30000; //TODO READ CONFILE
+            traitement_metric(result, cache, client);
+        } else {
+          timeout = timeout - timeCurrent;
         }
 
         void *which = zpoller_wait (poller, timeout);
@@ -597,7 +666,7 @@ fty_alert_engine_stream(
         // doing actual work
 
         // METRICS messages received in this round
-        std::unordered_map<std::string, fty_proto_t*> stream_messages;
+//        std::unordered_map<std::string, fty_proto_t*> stream_messages;
         // Mailbox message received (if any)
         zmsg_t *zmessage = NULL;
         std::string subject;
@@ -632,18 +701,18 @@ fty_alert_engine_stream(
                 fty_proto_destroy(&bmessage);
                 break;
             }
-            auto it = stream_messages.find(topic);
-            if (it == stream_messages.end()) {
-                stream_messages.emplace(topic, bmessage);
-            } else {
-                // Discard the old METRICS update, we did not manage to process
-                // it in time.
-                log_warning("%s: Metrics update '%s' processed too late, discarding", name, topic.c_str());
-                fty_proto_destroy(&it->second);
-                it->second = bmessage;
-            }
-            // Check if further messages are pending
-            which = zpoller_wait(poller, 0);
+//            auto it = stream_messages.find(topic);
+//            if (it == stream_messages.end()) {
+//                stream_messages.emplace(topic, bmessage);
+//            } else {
+//                // Discard the old METRICS update, we did not manage to process
+//                // it in time.
+//                log_warning("%s: Metrics update '%s' processed too late, discarding", name, topic.c_str());
+//                fty_proto_destroy(&it->second);
+//                it->second = bmessage;
+//            }
+//            // Check if further messages are pending
+//            which = zpoller_wait(poller, 0);
         }
 
         if (which == pipe) {
@@ -699,61 +768,6 @@ fty_alert_engine_stream(
         // but even so we try to decide according what we got, not from where
 
         // process accumulated stream messages
-        for (auto element : stream_messages) {
-            std::string topic = element.first;
-            fty_proto_t *bmessage = element.second;
-
-            // process as metric message
-            const char *type = fty_proto_type (bmessage);
-            const char * name = fty_proto_name (bmessage);
-            const char *value = fty_proto_value (bmessage);
-            const char *unit = fty_proto_unit (bmessage);
-            uint32_t ttl = fty_proto_ttl (bmessage);
-            uint64_t timestamp = fty_proto_aux_number (bmessage, "time", ::time(NULL));
-            // TODO: 2016-04-27 ACE: fix it later, when "string" values
-            // in the metric would be considered as
-            // normal behaviour, but for now it is not supposed to be so
-            // -> generated error messages into the log
-            char *end;
-            double dvalue = strtod (value, &end);
-            if (errno == ERANGE) {
-                errno = 0;
-                //fty_proto_print (bmessage);
-                log_error ("%s: can't convert value to double #1, ignore message", name);
-                fty_proto_destroy (&bmessage);
-                continue;
-            }
-            else if (end == value || *end != '\0') {
-                //fty_proto_print (bmessage);
-                log_error ("%s: can't convert value to double #2, ignore message", name);
-                fty_proto_destroy (&bmessage);
-                continue;
-            }
-            log_debug("%s: Got message '%s' with value %s", name, topic.c_str(), value);
-
-            // Update cache with new value
-            MetricInfo m (name, type, unit, dvalue, timestamp, "", ttl);
-            cache.addMetric (m);
-
-            //search if this metric is already evaluated and if this metric is evaluate
-            std::map < std::string, bool>::iterator found = evaluateMetrics.find (m.generateTopic());
-            bool metricfound = found != evaluateMetrics.end();
-            log_debug ("Check metric : %s", m.generateTopic().c_str());
-            if (metricfound && ManageFtyLog::getInstanceFtylog()->isLogDebug()) {
-                log_debug ("This metric is known and %s be evaluated", found->second ? "must" : "will not");
-            }
-
-            if (!metricfound || found->second) {
-                bool isEvaluate = evaluate_metric (client, m, cache, alertConfiguration);
-
-                //if the metric is evaluate for the first time, add to the list
-                if (!metricfound) {
-                    log_debug ("Add %s evaluated metric '%s'", isEvaluate ? " " : "not", m.generateTopic().c_str());
-                    evaluateMetrics[m.generateTopic()] = isEvaluate;
-                }
-            }
-            fty_proto_destroy (&bmessage);
-        }
         if (zmessage) {
             // Here we can have a message with arbitrary topic, but according protocol
             // first frame must be one of the following:

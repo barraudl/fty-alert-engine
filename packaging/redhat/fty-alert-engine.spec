@@ -56,6 +56,7 @@ BuildRequires:  zeromq-devel
 BuildRequires:  czmq-devel
 BuildRequires:  malamute-devel
 BuildRequires:  fty-proto-devel
+BuildRequires:  fty_shm-devel
 BuildRequires:  lua-devel
 BuildRequires:  cxxtools-devel
 BuildRequires:  log4cplus-devel
@@ -92,6 +93,7 @@ Requires:       zeromq-devel
 Requires:       czmq-devel
 Requires:       malamute-devel
 Requires:       fty-proto-devel
+Requires:       fty_shm-devel
 Requires:       lua-devel
 Requires:       cxxtools-devel
 Requires:       log4cplus-devel
